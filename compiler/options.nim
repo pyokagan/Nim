@@ -99,7 +99,7 @@ type
   TCommands* = enum           # Nim's commands
                               # **keep binary compatible**
     cmdNone, cmdCompileToC, cmdCompileToCpp, cmdCompileToOC,
-    cmdCompileToJS,
+    cmdCompileToJS, cmdCompileToPJS,
     cmdCompileToLLVM, cmdInterpret, cmdPretty, cmdDoc,
     cmdGenDepend, cmdDump,
     cmdCheck,                 # semantic checking for whole project
@@ -563,7 +563,7 @@ proc getNimcacheDir*(conf: ConfigRef): AbsoluteDir =
   # XXX projectName should always be without a file extension!
   result = if not conf.nimcacheDir.isEmpty:
              conf.nimcacheDir
-           elif conf.cmd == cmdCompileToJS:
+           elif conf.cmd in {cmdCompileToJS,cmdCompileToPJS}:
              conf.projectPath / genSubDir
            else:
             AbsoluteDir(getOsCacheDir() / splitFile(conf.projectName).name &

@@ -794,7 +794,7 @@ proc singlePragma(c: PContext, sym: PSym, n: PNode, i: var int,
       of wImportCpp:
         processImportCpp(c, sym, getOptionalStr(c, it, "$1"), it.info)
       of wImportJs:
-        if c.config.cmd != cmdCompileToJS:
+        if c.config.cmd notin {cmdCompileToJS, cmdCompileToPJS}:
           localError(c.config, it.info, "`importjs` pragma requires the JavaScript target")
         let name = getOptionalStr(c, it, "$1")
         incl(sym.flags, sfImportc)

@@ -231,7 +231,7 @@ template isIterator*(owner: PSym): bool =
 proc liftingHarmful(conf: ConfigRef; owner: PSym): bool {.inline.} =
   ## lambda lifting can be harmful for JS-like code generators.
   let isCompileTime = sfCompileTime in owner.flags or owner.kind == skMacro
-  result = conf.cmd == cmdCompileToJS and not isCompileTime
+  result = conf.cmd in {cmdCompileToJS,cmdCompileToPJS} and not isCompileTime
 
 proc createTypeBoundOpsLL(g: ModuleGraph; refType: PType; info: TLineInfo) =
   createTypeBoundOps(g, nil, refType.lastSon, info)
@@ -841,7 +841,7 @@ proc liftLambdas*(g: ModuleGraph; fn: PSym, body: PNode; tooEarly: var bool;
   let isCompileTime = sfCompileTime in fn.flags or fn.kind == skMacro
 
   if body.kind == nkEmpty or (
-      g.config.cmd == cmdCompileToJS and not isCompileTime) or
+      g.config.cmd in {cmdCompileToJS,cmdCompileToPJS} and not isCompileTime) or
       fn.skipGenericOwner.kind != skModule:
 
     # ignore forward declaration:

@@ -23,6 +23,7 @@ import
 
 when not defined(leanCompiler):
   import jsgen, docgen, docgen2
+import pjsgen
 
 proc semanticPasses(g: ModuleGraph) =
   registerPass g, verbosePass
@@ -125,6 +126,22 @@ when not defined(leanCompiler):
     if optGenScript in graph.config.globalOptions:
       writeDepsFile(graph)
 
+proc commandCompileToPjs(graph: ModuleGraph) =
+  let conf = graph.config
+  if conf.outDir.isEmpty:
+    conf.outDir = conf.projectPath
+  if conf.outFile.isEmpty:
+    conf.outFile = RelativeFile(conf.projectName & ".pjs")
+  setTarget(graph.config.target, osJS, cpuJS)
+  defineSymbol(graph.config.symbols, "ecmascript") # For backward compatibility
+  defineSymbol(graph.config.symbols, "js")
+  defineSymbol(graph.config.symbols, "pjs")
+  semanticPasses(graph)
+  registerPass(graph, PjsGenPass)
+  compileProject(graph)
+  if optGenScript in graph.config.globalOptions:
+    writeDepsFile(graph)
+
 proc interactivePasses(graph: ModuleGraph) =
   initDefines(graph.config.symbols)
   defineSymbol(graph.config.symbols, "nimscript")
@@ -213,6 +230,9 @@ proc mainCommand*(graph: ModuleGraph) =
         # A better solution might be to fix system.nim
         undefSymbol(conf.symbols, "useNimRtl")
       commandCompileToJS(graph)
+  of "pjs", "compiletopjs":
+    conf.cmd = cmdCompileToPJS
+    commandCompileToPjs(graph)
   of "doc0":
     when defined(leanCompiler):
       quit "compiler wasn't built with documentation generator"
