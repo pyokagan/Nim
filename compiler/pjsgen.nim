@@ -19,7 +19,6 @@ type
     graph: ModuleGraph
     g: PGlobals
     config: ConfigRef
-    s: TCFileSections
     typeCache: TypeCache # cache for generated types
     forwTypeCache: TypeCache # cache for getTypeForward()
     typeStack: TTypeSeq
@@ -27,11 +26,11 @@ type
   TProc = object
     m: BModule
     prc: PSym # The Nim proc that this proc belongs to, can be NIL for module!
+    up: BProc # Up the call chain; required for closure support
     blocks: seq[TBlock]
   PGlobals = ref object of RootObj
-    typeInfo: Rope
-    constants: Rope
-    code: Rope
+    generatedSyms: IntSet
+    s: TCFileSections
   TResKind = enum
     resNone # not set
     resExpr # is some complex expression
@@ -96,6 +95,7 @@ proc newProc(m: BModule; prc: PSym): BProc =
   new(result)
   result.m = m
   result.prc = prc
+  result.blocks.setLen(1)
 
 template config*(p: BProc): ConfigRef =
   p.m.config
@@ -112,7 +112,7 @@ proc procSec*(p: BProc, s: TCProcSection): var Rope {.inline.} =
 
 import macros
 
-proc pjsSym(m: BModule; name: string): Rope
+proc pjsSym(m: BModule; name: string): Rope {.discardable.}
 
 proc pjsFormatValue(result: var string; value: Rope): void =
   for str in leaves(value):
@@ -322,6 +322,17 @@ proc makeJSString(s: string, escapeNonAscii = true): Rope =
     result = escapeJSString(s).rope
 
 # }}}
+# {{{ TCompRes
+
+proc initCompRes(): TCompRes {.inline.} =
+  result.typ = etyVoid
+  result.kind = resNone
+  result.res = nil
+
+proc rdLoc(a: TCompRes): Rope {.inline.} =
+  result = a.res
+
+# }}}
 # {{{ Blocks
 
 proc startBlockInternal(p: BProc): int {.discardable.} =
@@ -431,7 +442,7 @@ proc mapType(conf: ConfigRef; typ: PType): TPjsTypeKind =
       else: result = etyInt32
   of tyRange:
     result = mapType(conf, typ.sons[0])
-  of tyRef: result = etyRef
+  of tyVar, tyRef, tyPtr, tyLent: result = etyRef
   of tySequence: result = etyNimSeq
   of tyProc: result = etyProc
   of tyString: result = etyNimStr
@@ -511,7 +522,7 @@ proc structOrUnion(t: PType): Rope =
 
 proc addForwardStructFormat(m: BModule, structOrUnion: Rope, typename: Rope) =
   # e.g. struct Foo;
-  m.s[jfsForwardTypes].addf("$1 $2;$n", [structOrUnion, typename])
+  m.g.s[jfsForwardTypes].addf("$1 $2;$n", [structOrUnion, typename])
 
 proc wrapRef(typename: Rope): Rope =
   let cachedRef {.global.} = rope("ref[")
@@ -574,7 +585,7 @@ proc getTypeDescAux(m: BModule, origTyp: PType, check: var IntSet): Rope =
     excl(check, t.id)
     return
   case t.kind
-  of tyRef:
+  of tyRef, tyPtr, tyVar, tyLent:
     var et = origTyp.skipTypes(abstractInst).lastSon
     var etB = et.skipTypes(abstractInst)
     case etB.kind
@@ -607,14 +618,14 @@ proc getTypeDescAux(m: BModule, origTyp: PType, check: var IntSet): Rope =
         m.typeCache[sig] = result
         var size: int
         if firstOrd(m.config, t) < 0:
-          addf(m.s[jfsTypes], "type $1 = i32;$n", [result])
+          addf(m.g.s[jfsTypes], "type $1 = i32;$n", [result])
           size = 4
         else:
           size = int(getSize(m.config, t))
           case size
-          of 1: addf(m.s[jfsTypes], "type $1 = u8;$n", [result])
-          of 2: addf(m.s[jfsTypes], "type $1 = u16;$n", [result])
-          of 4: addf(m.s[jfsTypes], "type $1 = i32;$n", [result])
+          of 1: addf(m.g.s[jfsTypes], "type $1 = u8;$n", [result])
+          of 2: addf(m.g.s[jfsTypes], "type $1 = u16;$n", [result])
+          of 4: addf(m.g.s[jfsTypes], "type $1 = i32;$n", [result])
           else: internalError(m.config, t.sym.info, "getTypeDescAux: enum")
   of tyProc:
     result = getTypeName(m, origTyp, sig)
@@ -623,7 +634,7 @@ proc getTypeDescAux(m: BModule, origTyp: PType, check: var IntSet): Rope =
     #TODO
     #genProcParams(m, t, rettype, desc, check, true, true)
     if not isImportedType(t):
-      addf(m.s[jfsTypes], "type $2 = fn ($1, $3);$n", [rettype, result, desc])
+      addf(m.g.s[jfsTypes], "type $2 = fn ($1, $3);$n", [rettype, result, desc])
   else:
     internalError(m.config, "getTypeDescAux(" & $t.kind & ')')
     result = nil
@@ -636,10 +647,12 @@ proc getTypeDesc(m: BModule, typ: PType): Rope =
 # {{{ gen
 
 proc genStmt(p: BProc, n: PNode): void
+proc genProc(oldProc: BProc; prc: PSym): Rope
 proc gen(p: BProc, n: PNode, r: var TCompRes): void
+proc createVar(p: BProc; typ: PType): Rope
+proc genConstant(p: BProc, c: PSym): void
 
-proc isIndirect(v: PSym): bool {.inline.} =
-  {sfAddrTaken, sfGlobal} * v.flags != {} and {sfImportc, sfExportc} * v.flags == {} and v.kind notin {skProc, skFunc, skConverter, skMethod, skIterator, skConst, skTemp, skLet}
+template returnType: untyped = ~""
 
 proc genLineDir(p: BProc, n: PNode): void =
   # TODO: Support linedir?
@@ -652,6 +665,184 @@ proc genVarInit(p: BProc, v: PSym, n: PNode) =
   var varName = mangleName(p.m, v)
   var t = getTypeDesc(p.m, v.typ)
   appjs(p, jpsLocals, "let $1: $2;$n", [varName, t])
+
+proc generateHeader(p: BProc, typ: PType): Rope =
+  result = nil
+  for i in 1 ..< len(typ.n):
+    assert(typ.n.sons[i].kind == nkSym)
+    var param = typ.n.sons[i].sym
+    if isCompileTimeOnly(param.typ): continue
+    if result != nil: add(result, ", ")
+    var name = mangleName(p.m, param)
+    add(result, name)
+    add(result, ": ")
+    add(result, getTypeDesc(p.m, param.typ))
+
+proc createVar(p: BProc, typ: PType): Rope =
+  var t = skipTypes(typ, abstractInst)
+  case t.kind
+  of tyInt..tyInt64, tyUInt..tyUInt64, tyEnum, tyChar:
+    result = rope("0")
+  of tyFloat..tyFloat128:
+    result = rope("0.0")
+  of tyRange, tyGenericInst, tyAlias, tySink, tyOwned:
+    result = createVar(p, lastSon(typ))
+  of tySet:
+    result = rope("{}")
+  of tyBool:
+    result = rope("false")
+  of tyNil:
+    result = rope("null")
+  of tyArray:
+    let length = toInt(lengthOrd(p.config, t))
+    let e = elemType(t)
+    let jsTyp = "SomeType"
+    if jsTyp.len > 0:
+      result = "new $1($2)" % [rope(jsTyp), rope(length)]
+    elif length > 32:
+      pjsSym(p.m, "arrayConstr")
+      # XXX: arrayConstr depends on nimCopy. This line shouldn't be necessary.
+      pjsSym(p.m, "nimCopy")
+      result = "arrayConstr($1, $2)" % [rope(length),
+          createVar(p, e)]
+    else:
+      result = rope("[")
+      var i = 0
+      while i < length:
+        if i > 0: add(result, ", ")
+        add(result, createVar(p, e))
+        inc(i)
+      add(result, "]")
+  of tyTuple:
+    result = rope("{")
+    for i in 0..<t.len:
+      if i > 0: add(result, ", ")
+      addf(result, "Field$1: $2", [i.rope,
+            createVar(p, t.sons[i])])
+    add(result, "}")
+  of tyObject:
+    var initList: Rope
+    initList = rope("TODO")
+    #createObjInitList(p, t, initIntSet(), initList)
+    result = ("{$1}") % [initList]
+  of tyVar, tyPtr, tyLent, tyRef, tyPointer:
+    result = rope("null")
+  of tySequence, tyOpt, tyString, tyCString, tyProc:
+    result = rope("null")
+  of tyStatic:
+    if t.n != nil:
+      result = createVar(p, lastSon t)
+    else:
+      internalError(p.config, "createVar: " & $t.kind)
+      result = nil
+  else:
+    internalError(p.config, "createVar: " & $t.kind)
+    result = nil
+
+proc genProcBody(p: BProc, prc: PSym): Rope =
+  result = nil
+  add(result, blockBody(p.blocks[0]))
+
+proc optionalLine(p: Rope): Rope =
+  if p == nil:
+    return nil
+  else:
+    return p & "\L"
+
+proc genProc(oldProc: BProc, prc: PSym): Rope =
+  var resultSym: PSym
+  var a = initCompRes()
+  #if gVerbosity >= 3:
+  #  echo "BEGIN generating code for: " & prc.name.s
+  var p = newProc(oldProc.m, prc)
+  p.up = oldProc
+  var returnStmt: Rope = nil
+  var resultAsgn: Rope = nil
+  var name = mangleName(p.m, prc)
+  let header = generateHeader(p, prc.typ)
+  if prc.typ.sons[0] != nil and sfPure notin prc.flags:
+    resultSym = prc.ast.sons[resultPos].sym
+    let mname = mangleName(p.m, resultSym)
+    let resVar = createVar(p, resultSym.typ)
+    resultAsgn = p.indentLine(("var $# = $#;$n") % [mname, resVar])
+    gen(p, prc.ast.sons[resultPos], a)
+    returnStmt = "return $#;$n" % [a.res]
+
+  let transformedBody = transformBody(oldProc.m.graph, prc, cache = false)
+  genStmt(p, transformedBody)
+
+  var def: Rope
+  if not prc.constraint.isNil:
+    def = runtimeFormat(prc.constraint.strVal & " {$n$#$#$#",
+            [ returnType,
+              name,
+              header,
+              optionalLine(resultAsgn),
+              optionalLine(genProcBody(p, prc)),
+              optionalLine(p.indentLine(returnStmt))])
+  else:
+    result = ~"\L"
+    def = "function $#($#) {$n$#$#$#" %
+            [ name,
+              header,
+              optionalLine(resultAsgn),
+              optionalLine(genProcBody(p, prc)),
+              optionalLine(p.indentLine(returnStmt))]
+
+  result.add p.indentLine(def)
+  result.add p.indentLine(~"}$n")
+
+proc attachProc(p: BProc; content: Rope; s: PSym) =
+  add(p.m.g.s[jfsProcs], content)
+
+proc attachProc(p: BProc; s: PSym) =
+  let newp = genProc(p, s)
+  attachProc(p, newp, s)
+
+proc genProcForSymIfNeeded(p: BProc; s: PSym): void =
+  if not p.m.g.generatedSyms.containsOrIncl(s.id):
+    let newp = genProc(p, s)
+    var owner = p
+    while owner != nil and owner.prc != s.owner:
+      owner = owner.up
+    if owner != nil:
+      add(owner.blocks[0].sections[jpsLocals], newp)
+    else: attachProc(p, newp, s)
+
+proc genSym(p: BProc; n: PNode; r: var TCompRes): void =
+  var s = n.sym
+  case s.kind
+  of skVar, skLet, skParam, skTemp, skResult, skForVar:
+    if s.loc.r == nil:
+      internalError(p.config, n.info, "symbol has no generated name: " & s.name.s)
+    if sfCompileTime in s.flags:
+      genVarInit(p, s, if s.ast != nil: s.ast else: newNodeI(nkEmpty, s.info))
+    r.res = s.loc.r
+  of skConst:
+    genConstant(p, s)
+    if s.loc.r == nil:
+      internalError(p.config, n.info, "symbol has no generated name: " & s.name.s)
+    r.res = s.loc.r
+  of skProc, skFunc, skConverter, skMethod:
+    if sfCompileTime in s.flags:
+      localError(p.config, n.info, "request to generate code for .compileTime proc: " & s.name.s)
+    discard mangleName(p.module, s)
+    r.res = s.loc.r
+    if lfNoDecl in s.loc.flags or s.magic != mNone or {sfImportc, sfInfixCall} * s.flags != {}:
+      discard
+    elif s.kind == skMethod and s.getBody.kind == nkEmpty:
+      # we cannot produce code for the dispatcher yet:
+      discard
+    elif sfForward in s.flags:
+      # TODO
+      discard
+    else:
+      genProcForSymIfNeeded(p, s)
+  else:
+    if s.loc.r == nil:
+      internalError(p.config, n.info, "symbol has no generated name: " & s.name.s)
+    r.res = s.loc.r
+  r.kind = resVal
 
 proc genVarStmt(p: BProc, n: PNode) =
   for i in 0 ..< len(n):
@@ -672,7 +863,38 @@ proc genVarStmt(p: BProc, n: PNode) =
             # lazy emit, done when it's actually used.
             if v.ast == nil: v.ast = a[2]
 
+proc genStmt(p: BProc, n: PNode): void =
+  var r: TCompRes
+  gen(p, n, r)
+  if r.res != nil:
+    lineF(p, jpsStmts, "$#;$n", [r.res])
+
+proc genAsmOrEmitStmt(p: BProc; n: PNode): void =
+  for i in 0 ..< len(n):
+    let it = n[i]
+    case it.kind
+    of nkStrLit..nkTripleStrLit:
+      add(p.s(jpsStmts), it.strVal)
+    of nkSym:
+      let v = it.sym
+      # for backwards compatibility we don't deref syms here :-(
+      var r = initCompRes()
+      gen(p, it, r)
+      add(p.s(jpsStmts), rdLoc(r))
+    else:
+      var r = initCompRes()
+      gen(p, it, r)
+      add(p.s(jpsStmts), rdLoc(r))
+  add(p.s(jpsStmts), "\L")
+
+proc genPragma(p: BProc; n: PNode): void =
+  for it in n.sons:
+    case whichPragma(it)
+    of wEmit: genAsmOrEmitStmt(p, it.sons[1])
+    else: discard
+
 proc gen(p: BProc, n: PNode, r: var TCompRes): void =
+  echo(n)
   r.typ = etyVoid
   r.kind = resNone
   case n.kind
@@ -698,14 +920,9 @@ proc gen(p: BProc, n: PNode, r: var TCompRes): void =
      nkImportStmt, nkImportExceptStmt, nkExportStmt, nkExportExceptStmt,
      nkFromStmt, nkTemplateDef, nkMacroDef, nkStaticStmt:
     discard
+  of nkPragma: genPragma(p, n)
   else:
     internalError(p.config, n.info, "gen: unknown node type: " & $n.kind)
-
-proc genStmt(p: BProc, n: PNode): void =
-  var r: TCompRes
-  gen(p, n, r)
-  if r.res != nil:
-    lineF(p, jpsStmts, "$#;$n", [r.res])
 
 proc genModule(p: BProc, n: PNode): void =
   var transformedN = transformStmt(p.m.graph, p.m.module, n)
@@ -714,7 +931,7 @@ proc genModule(p: BProc, n: PNode): void =
 proc genProc(m: BModule; prc: PSym): void =
   discard
 
-proc pjsSym(m: BModule; name: string): Rope =
+proc pjsSym(m: BModule; name: string): Rope {.discardable.} =
   let sym = magicsys.getCompilerProc(m.graph, name)
   if sym != nil:
     case sym.kind
