@@ -324,6 +324,14 @@ proc makeJSString(s: string, escapeNonAscii = true): Rope =
 # }}}
 # {{{ TCompRes
 
+proc fillLoc(a: var TLoc, k: TLocKind, lode: PNode, r: Rope, s: TStorageLoc) =
+  # fills the loc if it is not already initialized
+  if a.k == locNone:
+    a.k = k
+    a.lode = lode
+    a.storage = s
+    if a.r == nil: a.r = r
+
 proc initCompRes(): TCompRes {.inline.} =
   result.typ = etyVoid
   result.kind = resNone
@@ -650,13 +658,73 @@ proc genStmt(p: BProc, n: PNode): void
 proc genProc(oldProc: BProc; prc: PSym): Rope
 proc gen(p: BProc, n: PNode, r: var TCompRes): void
 proc createVar(p: BProc; typ: PType): Rope
-proc genConstant(p: BProc, c: PSym): void
+proc genConstExpr(p: BProc, n: PNode; ty: PType): Rope
 
 template returnType: untyped = ~""
 
 proc genLineDir(p: BProc, n: PNode): void =
   # TODO: Support linedir?
   discard
+
+proc intLiteral(i: BiggestInt): Rope =
+  if i >= low(int8) and i <= high(int8):
+    result = rope(i) & "'i8"
+  elif i >= low(int16) and i <= high(int16):
+    result = rope(i) & "'i16"
+  else:
+    result = rope(i) & "'i32"
+
+proc uintLiteral(i: BiggestInt): Rope =
+  if i <= high(uint8).int:
+    result = rope(i) & "'u8"
+  elif i <= high(uint16).int:
+    result = rope(i) & "'u16"
+  else:
+    result = rope(i) & "'u32"
+
+proc genConstExpr(p: BProc; n: PNode; ty: PType): Rope =
+  case n.kind
+  of nkCharLit..nkUInt64Lit:
+    var k: TTypeKind
+    if ty != nil:
+      k = skipTypes(ty, abstractVarRange).kind
+    else:
+      case n.kind
+      of nkCharLit: k = tyChar
+      of nkIntLit..nkInt64Lit: k = tyInt
+      of nkUIntLit..nkUInt64Lit: k = tyUInt
+      else: k = tyNil
+    case k
+    of tyNil:
+      result = intLiteral(n.intVal)
+    of tyChar, tyUInt:
+      result = uintLiteral(n.intVal)
+    of tyBool:
+      if n.intVal != 0: result = ~"true"
+      else: result = ~"false"
+    else:
+      result = intLiteral(n.intVal)
+  of nkNilLit:
+    result = rope("null");
+  of nkStrLit..nkTripleStrLit:
+    result = rope("[SOME STRING]")
+  of nkFloatLit, nkFloat64Lit:
+    result = rope(n.floatVal.toStrMaxPrecision("'f64"))
+  of nkFloat32Lit:
+    result = rope(n.floatVal.toStrMaxPrecision("'f32"))
+  of nkHiddenStdConv, nkHiddenSubConv:
+    result = genConstExpr(p, n.sons[1], n.sons[1].typ)
+  else:
+    internalError(p.config, n.info, "genLiteral(" & $n.kind & ')')
+    result = nil
+
+proc genConstExpr(p: BProc; n: PNode): Rope =
+  result = genConstExpr(p, n, n.typ)
+
+proc genConst(p: BProc; sym: PSym): void =
+  let g = p.m.g
+  if not g.generatedSyms.containsOrIncl(sym.id):
+    addf(g.s[jfsData], "const $1: $2 = $3;$n", [mangleName(p.m, sym), getTypeDesc(p.m, sym.typ), genConstExpr(p, sym.ast)])
 
 proc genVarInit(p: BProc, v: PSym, n: PNode) =
   var a: TCompRes
@@ -819,14 +887,14 @@ proc genSym(p: BProc; n: PNode; r: var TCompRes): void =
       genVarInit(p, s, if s.ast != nil: s.ast else: newNodeI(nkEmpty, s.info))
     r.res = s.loc.r
   of skConst:
-    genConstant(p, s)
+    genConst(p, s)
     if s.loc.r == nil:
       internalError(p.config, n.info, "symbol has no generated name: " & s.name.s)
     r.res = s.loc.r
   of skProc, skFunc, skConverter, skMethod:
     if sfCompileTime in s.flags:
       localError(p.config, n.info, "request to generate code for .compileTime proc: " & s.name.s)
-    discard mangleName(p.module, s)
+    discard mangleName(p.m, s)
     r.res = s.loc.r
     if lfNoDecl in s.loc.flags or s.magic != mNone or {sfImportc, sfInfixCall} * s.flags != {}:
       discard
@@ -921,6 +989,12 @@ proc gen(p: BProc, n: PNode, r: var TCompRes): void =
      nkFromStmt, nkTemplateDef, nkMacroDef, nkStaticStmt:
     discard
   of nkPragma: genPragma(p, n)
+  of nkProcDef, nkFuncDef, nkMethodDef, nkConverterDef:
+    var s = n.sons[namePos].sym
+    if {sfExportc, sfCompilerProc} * s.flags == {sfExportc}:
+      genSym(p, n.sons[namePos], r)
+      r.res = nil
+  of nkEmpty: discard
   else:
     internalError(p.config, n.info, "gen: unknown node type: " & $n.kind)
 
@@ -946,8 +1020,10 @@ proc pjsSym(m: BModule; name: string): Rope {.discardable.} =
 # {{{
 
 proc wholeCode(m: BModule): Rope =
-  let globals = PGlobals(m.graph.backend)
-  result = globals.code
+  let g = PGlobals(m.graph.backend)
+  result = nil
+  for x in g.s:
+    result = result & x
 
 proc myOpen(graph: ModuleGraph; module: PSym): PPassContext =
   result = newModule(graph, module)
